@@ -315,6 +315,8 @@ public:
 
     const llama_hparams hparams;
     const llama_cparams cparams;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
@@ -355,6 +357,8 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 // V-less input for the KV cache
@@ -391,6 +395,8 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 class llm_graph_input_attn_k_dsa : public llm_graph_input_i {
@@ -432,6 +438,8 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_dsa_context * mctx;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 // DSA input (full-attention layers + indexer) with K-only input for the SWA layers
@@ -458,6 +466,8 @@ public:
     std::unique_ptr<llm_graph_input_attn_k>     inp_swa;
 
     const llama_kv_cache_dsa_iswa_context * mctx;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 // standard K/V attention input against the base cache, plus destination indices for the indexer key cache
@@ -478,6 +488,8 @@ public:
     ggml_tensor * self_k_idxs_idx = nullptr; // I64 [n_batch]
 
     const llama_kv_cache_msa_context * mctx_msa;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
@@ -524,6 +536,8 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {
@@ -563,6 +577,8 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
@@ -655,6 +671,8 @@ public:
     ggml_tensor * cross_kq_mask_cnv = nullptr; // F32/F16 [n_outputs_enc, n_batch, 1, 1]
 
     const llama_cross * cross = nullptr;
+    ggml_tensor * self_block_table = nullptr; // I32     [max_pages_per_seq, n_stream]
+    ggml_tensor * get_block_table() const { return self_block_table; }
 };
 
 class llm_graph_input_mem_hybrid : public llm_graph_input_i {
@@ -1171,6 +1189,7 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+            ggml_tensor * block_table,
                   float   kq_scale,
                     int   il) const;
 

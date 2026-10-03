@@ -250,7 +250,8 @@ public:
             const llama_token * tokens,
             uint32_t n_tokens,
             uint32_t cell_start,
-            uint32_t stream_id);
+            uint32_t stream_id,
+            llama_kv_cells * cells = nullptr);
 
     void touch_block(llama_seq_id seq_id, llama_pos pos_start);
     void touch_seq(llama_seq_id seq_id);
@@ -262,14 +263,15 @@ public:
             uint32_t stream_id,
             llama_kv_block_meta & out_evicted,
             llama_seq_id keep_seq = -1,
-            llama_kv_cells * cells = nullptr);
+            llama_kv_cells * cells = nullptr,
+            bool force_physical_free = false);
 
     MemoryPressureAction check_memory_pressure_and_evict(
             std::vector<ggml_tensor *> & k_tensors,
             std::vector<ggml_tensor *> & v_tensors,
             uint32_t stream_id,
             llama_seq_id keep_seq,
-            llama_kv_cells * cells);
+            const std::vector<llama_kv_cells *> & cells_array);
 
     // Check if query needs cold SSD blocks.
     // If not needed, 0 disk operations occur (saves SSD IOPS and wear).
@@ -315,12 +317,12 @@ public:
     bool promote_from_warm_zero_copy(const llama_kv_block_id & target_id);
 
     // Remove block records when sequence or range is cleared
-    void remove_seq(llama_seq_id seq_id, llama_pos p0 = 0, llama_pos p1 = -1);
+    void remove_seq(llama_seq_id seq_id, llama_pos p0 = 0, llama_pos p1 = -1, llama_kv_cells * cells = nullptr);
 
     // Shift block positions when sequence is shifted (e.g. infinite text generation)
-    void shift_seq(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
-    void div_seq(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d);
-    void cp_seq(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t stream_id_dst, llama_pos p0, llama_pos p1);
+    void shift_seq(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta, llama_kv_cells * cells = nullptr);
+    void div_seq(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d, llama_kv_cells * cells = nullptr);
+    void cp_seq(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t stream_id_dst, llama_pos p0, llama_pos p1, llama_kv_cells * cells = nullptr);
 
     // Metrics tracking
     uint64_t get_evictions_count() const { return n_evictions; }

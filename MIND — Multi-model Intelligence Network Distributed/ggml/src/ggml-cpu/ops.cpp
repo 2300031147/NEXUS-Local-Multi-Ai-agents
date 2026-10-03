@@ -8487,8 +8487,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * block_table = (dst->op == GGML_OP_FLASH_ATTN_PAGED_EXT) ? dst->src[3] : nullptr;
+    const ggml_tensor * mask  = (dst->op == GGML_OP_FLASH_ATTN_PAGED_EXT) ? dst->src[4] : dst->src[3];
+    const ggml_tensor * sinks = (dst->op == GGML_OP_FLASH_ATTN_PAGED_EXT) ? nullptr     : dst->src[4];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8608,7 +8609,19 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             float s; // KQ value
 
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            const char * k_data;
+            if (block_table) {
+                const int32_t * block_table_data = (const int32_t *) block_table->data;
+                const int64_t max_pages_per_stream = block_table->ne[0];
+                const int64_t page_size = 32;
+                const int64_t logical_page = ic / page_size;
+                const int64_t page_offset = ic % page_size;
+                const int32_t physical_page = block_table_data[iq3 * max_pages_per_stream + logical_page];
+                const int64_t physical_token = physical_page * page_size + page_offset;
+                k_data = (const char *)k->data + physical_token*nbk1 + ik2*nbk2;
+            } else {
+                k_data = (const char *)k->data + ic*nbk1 + ik2*nbk2 + ik3*nbk3;
+            }
             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
 
             s = s*scale; // scale KQ value
@@ -8624,7 +8637,19 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            const char * v_data;
+            if (block_table) {
+                const int32_t * block_table_data = (const int32_t *) block_table->data;
+                const int64_t max_pages_per_stream = block_table->ne[0];
+                const int64_t page_size = 32;
+                const int64_t logical_page = ic / page_size;
+                const int64_t page_offset = ic % page_size;
+                const int32_t physical_page = block_table_data[iq3 * max_pages_per_stream + logical_page];
+                const int64_t physical_token = physical_page * page_size + page_offset;
+                v_data = (const char *)v->data + physical_token*nbv1 + iv2*nbv2;
+            } else {
+                v_data = (const char *)v->data + ic*nbv1 + iv2*nbv2 + iv3*nbv3;
+            }
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
@@ -8721,8 +8746,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * block_table = (dst->op == GGML_OP_FLASH_ATTN_PAGED_EXT) ? dst->src[3] : nullptr;
+    const ggml_tensor * mask  = (dst->op == GGML_OP_FLASH_ATTN_PAGED_EXT) ? dst->src[4] : dst->src[3];
+    const ggml_tensor * sinks = (dst->op == GGML_OP_FLASH_ATTN_PAGED_EXT) ? nullptr     : dst->src[4];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8885,7 +8911,20 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
             for (int tk = 0; tk < kv_tile; tk++) {
-                const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                const char * k_data;
+                if (block_table) {
+                    const int32_t * block_table_data = (const int32_t *) block_table->data;
+                    const int64_t max_pages_per_stream = block_table->ne[0];
+                    const int64_t page_size = 32;
+                    const int64_t logical_token = ic + tk;
+                    const int64_t logical_page = logical_token / page_size;
+                    const int64_t page_offset = logical_token % page_size;
+                    const int32_t physical_page = block_table_data[ik3 * max_pages_per_stream + logical_page];
+                    const int64_t physical_token = physical_page * page_size + page_offset;
+                    k_data = (const char *)k->data + physical_token*nbk1 + ik2*nbk2;
+                } else {
+                    k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                }
                 if (kv_type == GGML_TYPE_F16) {
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
@@ -8950,7 +8989,20 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // V accumulation: VKQ32 += softmax(KQ) * V
             // Pack V tile to contiguous F32, zero-padded
             for (int tk = 0; tk < kv_tile; tk++) {
-                const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
+                const char * v_data;
+                if (block_table) {
+                    const int32_t * block_table_data = (const int32_t *) block_table->data;
+                    const int64_t max_pages_per_stream = block_table->ne[0];
+                    const int64_t page_size = 32;
+                    const int64_t logical_token = ic + tk;
+                    const int64_t logical_page = logical_token / page_size;
+                    const int64_t page_offset = logical_token % page_size;
+                    const int32_t physical_page = block_table_data[iv3 * max_pages_per_stream + logical_page];
+                    const int64_t physical_token = physical_page * page_size + page_offset;
+                    v_data = (const char *)v->data + physical_token*nbv1 + iv2*nbv2;
+                } else {
+                    v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
+                }
                 if (kv_type == GGML_TYPE_F16) {
                     ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
                 } else {

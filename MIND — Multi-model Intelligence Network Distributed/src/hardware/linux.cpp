@@ -11,6 +11,7 @@
 #include <vector>
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
 
 namespace fs = std::filesystem;
 
@@ -70,7 +71,7 @@ MemoryTopology detect_linux_topology() {
 
     if (!soc_family.empty() || !soc_machine.empty()) {
         std::string combined = soc_family + " " + soc_machine + " " + soc_soc_id;
-        std::transform(combined.begin(), combined.end(), combined.begin(), ::tolower);
+        std::transform(combined.begin(), combined.end(), combined.begin(), [](unsigned char c) { return std::tolower(c); });
         if (combined.find("snapdragon") != std::string::npos ||
             combined.find("qualcomm") != std::string::npos ||
             combined.find("sm8") != std::string::npos ||
@@ -94,7 +95,7 @@ MemoryTopology detect_linux_topology() {
             std::string line;
             while (std::getline(cpuinfo, line)) {
                 std::string lower = line;
-                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
                 if (lower.find("qualcomm") != std::string::npos || lower.find("snapdragon") != std::string::npos) {
                     is_qualcomm_snapdragon = true;
                     topo.device_model = "Qualcomm Snapdragon";
@@ -118,7 +119,7 @@ MemoryTopology detect_linux_topology() {
         std::string dmi_board = read_first_line("/sys/class/dmi/id/board_name");
         std::string dmi_sys = read_first_line("/sys/class/dmi/id/sys_vendor");
         std::string combined_dmi = dmi_sys + " " + dmi_product + " " + dmi_board;
-        std::transform(combined_dmi.begin(), combined_dmi.end(), combined_dmi.begin(), ::tolower);
+        std::transform(combined_dmi.begin(), combined_dmi.end(), combined_dmi.begin(), [](unsigned char c) { return std::tolower(c); });
         if (combined_dmi.find("snapdragon") != std::string::npos ||
             combined_dmi.find("x elite") != std::string::npos ||
             combined_dmi.find("x plus") != std::string::npos ||
@@ -147,6 +148,7 @@ MemoryTopology detect_linux_topology() {
                         } else if (target == "amdgpu") {
                             // Check if APU or discrete
                             std::string vram_path = entry.path().string() + "/device/mem_info_vram_total";
+                            bool is_apu = false;
                             if (fs::exists(vram_path)) {
                                 size_t vram_bytes = 0;
                                 std::ifstream vf(vram_path);
@@ -155,11 +157,14 @@ MemoryTopology detect_linux_topology() {
                                         // <= 3GB VRAM carved out typically indicates an AMD APU
                                         topo.unified_memory = true;
                                         topo.accelerator = "rocm";
+                                        is_apu = true;
                                     } else {
-                                        has_amd_dgpu = true;
                                         topo.accelerator_memory = std::max(topo.accelerator_memory, vram_bytes);
                                     }
                                 }
+                            }
+                            if (!is_apu) {
+                                has_amd_dgpu = true;
                             }
                         } else if (target == "msm" || target == "kgsl") {
                             has_msm_gpu = true;
@@ -241,7 +246,7 @@ MemoryTopology detect_linux_topology() {
                 }
             }
         }
-        if (!has_hexagon_npu && fs::exists("/sys/class/accel") && !fs::is_empty("/sys/class/accel")) {
+        if (!has_hexagon_npu && is_qualcomm_snapdragon && fs::exists("/sys/class/accel") && !fs::is_empty("/sys/class/accel")) {
             has_hexagon_npu = true;
         }
     } catch (...) {}

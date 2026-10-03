@@ -9,6 +9,7 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <algorithm>
 
 struct llama_kv_cell_ext {
     // 2D spatial positions, typically used for M-RoPE
@@ -37,7 +38,12 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
-            if (i < warm.size()) warm[i] = false;
+        }
+
+        for (uint32_t p = 0; p < pages.size(); ++p) {
+            pages[p].used = 0;
+            pages[p].is_active = false;
+            pages[p].warm = false;
         }
 
         has_shift = false;
@@ -46,6 +52,18 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_pages[s].clear();
+        }
+    }
+
+    void clear() {
+        for (uint32_t p = 0; p < pages.size(); ++p) {
+            pages[p].warm = false;
+        }
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (pos[i] != -1) {
+                rm(i);
+            }
         }
     }
 
@@ -66,7 +84,11 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
-        warm.resize(n, false);
+
+        pages.resize((n + page_size - 1) / page_size);
+        for (uint32_t p = 0; p < pages.size(); ++p) {
+            pages[p].id = p;
+        }
 
         reset();
     }
@@ -164,17 +186,28 @@ public:
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
+            uint32_t pid = idx / page_size;
+
+            if (pos[idx] != -1 && pages[pid].warm) {
+                continue;
+            }
 
             if (pos[idx] == -1 && other.pos[j] != -1) {
-                used.insert(i + j);
+                used.insert(idx);
+                pages[pid].used++;
+                if (!pages[pid].is_active) pages[pid].is_active = true;
             }
 
             if (pos[idx] != -1 && other.pos[j] == -1) {
-                used.erase(i + j);
+                used.erase(idx);
+                if (pages[pid].used > 0) pages[pid].used--;
+                if (pages[pid].used == 0) {
+                    pages[pid].is_active = false;
+                }
             }
 
             if (pos[idx] != -1) {
-                seq_pos_rm(i + j);
+                seq_pos_rm(idx);
             }
 
             pos[idx] = other.pos[j];
@@ -182,7 +215,7 @@ public:
             seq[idx] = other.seq[j];
 
             if (pos[idx] != -1) {
-                seq_pos_add(i + j);
+                seq_pos_add(idx);
             }
 
             assert(shift[idx] == 0);
@@ -195,13 +228,24 @@ public:
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
+            uint32_t pid = idx / page_size;
+
+            if (pos[idx] != -1 && pages[pid].warm) {
+                continue;
+            }
 
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
+                pages[pid].used++;
+                if (!pages[pid].is_active) pages[pid].is_active = true;
             }
 
             if (pos[idx] != -1 && other.pos[j] == -1) {
                 used.erase(idx);
+                if (pages[pid].used > 0) pages[pid].used--;
+                if (pages[pid].used == 0) {
+                    pages[pid].is_active = false;
+                }
             }
 
             if (pos[idx] != -1) {
@@ -228,11 +272,23 @@ public:
         seq_pos_rm(i);
         seq[i].reset();
 
-        pos[i] = -1;
-        ext[i].reset();
-        shift[i] = 0;
+        uint32_t pid = i / page_size;
 
-        used.erase(i);
+        if (!pages[pid].warm) {
+            pos[i] = -1;
+            ext[i].reset();
+            shift[i] = 0;
+
+            used.erase(i);
+            
+            if (pages[pid].used > 0) pages[pid].used--;
+            if (pages[pid].used == 0) {
+                pages[pid].is_active = false;
+                auto & sp = seq_pages[pages[pid].owner];
+                auto it = std::find(sp.begin(), sp.end(), pid);
+                if (it != sp.end()) sp.erase(it);
+            }
+        }
     }
 
     // note: call only if the cell has seq_id
@@ -246,12 +302,22 @@ public:
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, pos[i]);
 
-        if (seq[i].none() && !warm[i]) {
+        uint32_t pid = i / page_size;
+
+        if (seq[i].none() && !pages[pid].warm) {
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
 
             used.erase(i);
+            
+            if (pages[pid].used > 0) pages[pid].used--;
+            if (pages[pid].used == 0) {
+                pages[pid].is_active = false;
+                auto & sp = seq_pages[pages[pid].owner];
+                auto it = std::find(sp.begin(), sp.end(), pid);
+                if (it != sp.end()) sp.erase(it);
+            }
 
             return true;
         }
@@ -277,12 +343,17 @@ public:
             seq_pos_rm(i);
             seq[i].reset();
 
-            if (!warm[i]) {
+            uint32_t pid = i / page_size;
+
+            if (!pages[pid].warm) {
                 pos[i] = -1;
                 ext[i].reset();
                 shift[i] = 0;
 
                 used.erase(i);
+                
+                if (pages[pid].used > 0) pages[pid].used--;
+                if (pages[pid].used == 0) pages[pid].is_active = false;
 
                 return true;
             }
@@ -325,15 +396,32 @@ public:
     }
 
     void set_warm(uint32_t i, bool is_warm) {
-        assert(i < warm.size());
-        warm[i] = is_warm;
+        assert(i < pos.size());
+        uint32_t pid = i / page_size;
+        assert(pid < pages.size());
+        pages[pid].warm = is_warm;
         
-        if (!is_warm && seq[i].none()) {
+        if (!is_warm && seq[i].none() && pos[i] != -1) {
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
             used.erase(i);
+            
+            if (pages[pid].used > 0) pages[pid].used--;
+            if (pages[pid].used == 0) {
+                pages[pid].is_active = false;
+                auto & sp = seq_pages[pages[pid].owner];
+                auto it = std::find(sp.begin(), sp.end(), pid);
+                if (it != sp.end()) sp.erase(it);
+            }
         }
+    }
+
+    bool is_warm(uint32_t i) const {
+        assert(i < pos.size());
+        uint32_t pid = i / page_size;
+        assert(pid < pages.size());
+        return pages[pid].warm;
     }
 
     // return the sequence id of this cell
@@ -431,6 +519,10 @@ public:
         pos[i] = p;
 
         used.insert(i);
+        
+        uint32_t pid = i / page_size;
+        pages[pid].used++;
+        pages[pid].is_active = true;
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
@@ -454,10 +546,18 @@ public:
 
         if (pos[i] < 0) {
             seq[i].reset();
-            pos[i] = -1;
-            shift[i] = 0;
+            
+            uint32_t pid = i / page_size;
+            
+            if (!pages[pid].warm) {
+                pos[i] = -1;
+                shift[i] = 0;
 
-            used.erase(i);
+                used.erase(i);
+                
+                if (pages[pid].used > 0) pages[pid].used--;
+                if (pages[pid].used == 0) pages[pid].is_active = false;
+            }
 
             return true;
         }
@@ -520,8 +620,61 @@ private:
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
 
-    // whether the cell is held in WARM storage (logical chunking)
-    std::vector<bool> warm;
+public:
+    struct llama_kv_page {
+        uint32_t id;
+        uint32_t used;
+        bool is_active;
+        bool warm;
+        llama_seq_id owner;
+    };
+    
+    std::vector<llama_kv_page> pages;
+    std::vector<uint32_t> seq_pages[LLAMA_MAX_SEQ];
+
+    uint32_t page_size = 32;
+    
+    // allocate a new page for a sequence
+    // returns -1 if no free pages are available
+    int32_t alloc_page(llama_seq_id seq_id) {
+        return alloc_contiguous_pages(seq_id, 1);
+    }
+    
+    // allocate n contiguous pages for a sequence
+    int32_t alloc_contiguous_pages(llama_seq_id seq_id, uint32_t n_pages) {
+        uint32_t count = 0;
+        int32_t start = -1;
+        for (uint32_t p = 0; p < pages.size(); ++p) {
+            if (!pages[p].is_active) {
+                if (count == 0) start = p;
+                count++;
+                if (count == n_pages) {
+                    for (uint32_t i = 0; i < n_pages; ++i) {
+                        pages[start + i].is_active = true;
+                        pages[start + i].used = 0;
+                        pages[start + i].warm = false;
+                        pages[start + i].owner = seq_id;
+                        seq_pages[seq_id].push_back(start + i);
+                    }
+                    return start;
+                }
+            } else {
+                count = 0;
+            }
+        }
+        return -1;
+    }
+    
+    // Check if the current page has space
+    // A page is full if all its cells are used
+    bool is_page_full(uint32_t pid) const {
+        assert(pid < pages.size());
+        // Since cells map directly: cells for page pid are [pid*page_size, (pid+1)*page_size)
+        // Note: a page might be active but have empty cells if seq_rm was called
+        return pages[pid].used >= page_size;
+    }
+
+private:
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set

@@ -68,12 +68,13 @@ void HardwareDetector::log_topology(const MemoryTopology & topo) {
             (double)topo.storage_capacity / (1024.0 * 1024.0 * 1024.0),
             (double)topo.storage_free / (1024.0 * 1024.0 * 1024.0));
     if (topo.compute.has_gpu || topo.compute.has_npu) {
+        std::string npu_str = topo.compute.has_npu ? ", NPU (" + topo.compute.npu_backend + ")" : "";
         fprintf(stderr, "   - Compute Units   : CPU (%s)%s%s%s%s\n",
                 topo.compute.cpu_backend.c_str(),
                 topo.compute.has_gpu ? ", GPU (" : "",
                 topo.compute.has_gpu ? topo.compute.gpu_backend.c_str() : "",
                 topo.compute.has_gpu ? ")" : "",
-                topo.compute.has_npu ? (", NPU (" + topo.compute.npu_backend + ")").c_str() : "");
+                npu_str.c_str());
     }
     fprintf(stderr, "===============================================================\n");
 }

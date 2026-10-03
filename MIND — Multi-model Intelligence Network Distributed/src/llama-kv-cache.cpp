@@ -231,8 +231,12 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        const uint32_t page_size = v_cells[0].page_size;
+        const uint32_t num_pages_per_stream = v_cells[0].pages.size();
+        const uint32_t total_pages = num_pages_per_stream * n_stream;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, page_size, total_pages) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, page_size, total_pages) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -241,8 +245,8 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s * num_pages_per_stream * k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s * num_pages_per_stream * v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
@@ -369,7 +373,7 @@ llama_kv_cache::llama_kv_cache(
 
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].reset();
+        v_cells[s].clear();
         v_heads[s] = 0;
     }
 
@@ -399,7 +403,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (swap_mgr) {
-        swap_mgr->remove_seq(seq_id, p0, p1);
+        llama_kv_cells * cells_ptr = nullptr;
+        if (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()) {
+            cells_ptr = &v_cells[seq_to_stream[seq_id]];
+        }
+        swap_mgr->remove_seq(seq_id, p0, p1, cells_ptr);
     }
 
     if (seq_id >= 0) {
@@ -483,7 +491,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         }
 
         if (swap_mgr) {
-            swap_mgr->cp_seq(seq_id_src, seq_id_dst, s0, p0, p1);
+            swap_mgr->cp_seq(seq_id_src, seq_id_dst, s0, p0, p1, &cells);
         }
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -518,10 +526,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     sc_info.sdst.push_back(s1);
 
     if (swap_mgr) {
-        swap_mgr->cp_seq(seq_id_src, seq_id_dst, s1, p0, p1);
+        swap_mgr->cp_seq(seq_id_src, seq_id_dst, s1, p0, p1, &v_cells[s1]);
     }
 
-    v_cells[s1].reset();
+    v_cells[s1].clear();
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
         if (v_cells[s0].seq_has(i, seq_id_src)) {
             llama_pos pos   = v_cells[s0].pos_get(i);
@@ -582,7 +590,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     // clear all other streams that do not belong to the kept sequence
     for (uint32_t s = 0; s < n_stream; ++s) {
         if (s != stream_kept) {
-            v_cells[s].reset();
+            v_cells[s].clear();
             v_heads[s] = 0;
         }
     }
@@ -613,7 +621,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     if (swap_mgr) {
-        swap_mgr->shift_seq(seq_id, p0, p1, shift);
+        swap_mgr->shift_seq(seq_id, p0, p1, shift, &cells);
     }
 
     uint32_t new_head = cells.size();
@@ -675,7 +683,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 
     if (swap_mgr) {
-        swap_mgr->div_seq(seq_id, p0, p1, d);
+        swap_mgr->div_seq(seq_id, p0, p1, d, &cells);
     }
 
     p0 = std::max<llama_pos>(0, p0);
@@ -1013,14 +1021,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     uint32_t n_tokens = ubatch.n_tokens;
-    uint32_t n_seqs   = 1;
-
-    if (n_stream > 1) {
-        GGML_ASSERT(n_tokens % ubatch.n_seqs_unq == 0);
-
-        n_seqs   = ubatch.n_seqs_unq;
-        n_tokens = n_tokens / n_seqs;
-    }
+    uint32_t n_seqs = ubatch.n_seqs_unq;
+    GGML_ASSERT(n_tokens % n_seqs == 0);
+    n_tokens = n_tokens / n_seqs;
 
     slot_info res = {
         /*.s0   =*/ LLAMA_MAX_SEQ,
@@ -1034,10 +1037,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const auto seq_id = ubatch.seq_id_unq[s];
 
-        if (n_stream > 1) {
-            GGML_ASSERT(ubatch.n_seq_id[s*n_tokens]    == 1);
-            GGML_ASSERT(ubatch.seq_id  [s*n_tokens][0] == seq_id);
-        }
+        GGML_ASSERT(ubatch.n_seq_id[s*n_tokens]    == 1);
+        GGML_ASSERT(ubatch.seq_id  [s*n_tokens][0] == seq_id);
 
         res.s0 = std::min<uint32_t>(res.s0, seq_to_stream[seq_id]);
         res.s1 = std::max<uint32_t>(res.s1, seq_to_stream[seq_id]);
@@ -1047,72 +1048,62 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
-
-        // start searching from current head
-        if (head_cur > cells.get_used() + 2*n_tokens) {
-            head_cur = 0;
-        }
-
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
-            return { };
-        }
-
-        uint32_t n_tested = 0;
-
-        // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
-        // for non-continuous slots, we test the tokens one by one
-        const uint32_t n_test = cont ? n_tokens : 1;
+        auto & cells_mut = const_cast<llama_kv_cells &>(cells);
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
-                head_cur = 0;
-                continue;
-            }
+            uint32_t tokens_found = 0;
+            res.idxs[s].clear();
 
-            for (uint32_t i = 0; i < n_test; i++) {
-                const auto idx = head_cur;
-
-                head_cur++;
-                n_tested++;
-
-                //const llama_pos    pos    = ubatch.pos[i];
-                //const llama_seq_id seq_id = ubatch.seq_id[i][0];
-
-                // can we use this cell? either:
-                //  - the cell is empty
-                //  - the cell is occupied only by one sequence:
-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
-                //    - mask SWA, using current max pos for that sequence in the cache
-                //                always insert in the cell with minimum pos
-                bool can_use = cells.is_empty(idx);
-
-                if (!can_use && cells.seq_count(idx) == 1) {
-                    const llama_pos pos_cell = cells.pos_get(idx);
-
-                    // (disabled) causal mask
-                    // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
-                    //    can_use = pos_cell >= pos;
-                    //}
-
-                    if (!can_use) {
-                        const llama_seq_id seq_id_cell = cells.seq_get(idx);
-
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
-                            can_use = true;
-                        }
+            if (cont) {
+                const uint32_t needed_pages = (n_tokens + cells_mut.page_size - 1) / cells_mut.page_size;
+                int32_t start_page = cells_mut.alloc_contiguous_pages(seq_id, needed_pages);
+                
+                if (start_page != -1) {
+                    for (uint32_t i = 0; i < n_tokens; ++i) {
+                        res.idxs[s].push_back(start_page * cells_mut.page_size + i);
                     }
                 }
+            } else {
+                // 1. Try to find space in existing active pages for this sequence (including SWA reusable)
+                const auto & seq_pages = cells_mut.seq_pages[seq_id];
+                for (uint32_t pid : seq_pages) {
+                    uint32_t p_start = pid * cells_mut.page_size;
+                    for (uint32_t i = 0; i < cells_mut.page_size; ++i) {
+                        uint32_t idx = p_start + i;
+                        bool can_use = cells_mut.is_empty(idx);
+                        
+                        if (!can_use && cells_mut.seq_count(idx) == 1) {
+                            const llama_pos pos_cell = cells_mut.pos_get(idx);
+                            const llama_seq_id seq_id_cell = cells_mut.seq_get(idx);
+                            if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells_mut.seq_pos_max(seq_id_cell) + 1)) {
+                                can_use = true;
+                            }
+                        }
+                        
+                        if (can_use) {
+                            // Check if this slot is already chosen
+                            if (std::find(res.idxs[s].begin(), res.idxs[s].end(), idx) == res.idxs[s].end()) {
+                                res.idxs[s].push_back(idx);
+                                tokens_found++;
+                                if (tokens_found == n_tokens) break;
+                            }
+                        }
+                    }
+                    if (tokens_found == n_tokens) break;
+                }
 
-                if (can_use) {
-                    res.idxs[s].push_back(idx);
-                } else {
-                    if (cont) {
-                        break;
+                // 2. Allocate new pages if we still need tokens
+                while (tokens_found < n_tokens) {
+                    int32_t new_page = cells_mut.alloc_page(seq_id);
+                    if (new_page != -1) {
+                        uint32_t p_start = new_page * cells_mut.page_size;
+                        for (uint32_t i = 0; i < cells_mut.page_size; ++i) {
+                            res.idxs[s].push_back(p_start + i);
+                            tokens_found++;
+                            if (tokens_found == n_tokens) break;
+                        }
+                    } else {
+                        break; // No more free pages
                     }
                 }
             }
@@ -1121,55 +1112,37 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 break;
             }
 
-            if (cont) {
-                res.idxs[s].clear();
-            }
-
-            if (n_tested >= cells.size()) {
-                if (swap_mgr) {
-                    std::vector<ggml_tensor *> k_tensors;
-                    std::vector<ggml_tensor *> v_tensors;
-                    for (const auto & l : layers) {
-                        k_tensors.push_back(l.k_stream[seq_to_stream[seq_id]]);
-                        v_tensors.push_back(l.v_stream[seq_to_stream[seq_id]]);
-                    }
-                    auto & cells_mut = const_cast<llama_kv_cells &>(v_cells[seq_to_stream[seq_id]]);
-                    bool any_evicted = false;
-                    uint32_t evicted_tokens = 0;
-                    const uint32_t needed_tokens = (cells_mut.get_used() + n_tokens > cells_mut.size()) ?
-                                                   (cells_mut.get_used() + n_tokens - cells_mut.size()) : n_tokens;
-
-                    while (evicted_tokens < needed_tokens) {
-                        llama_kv_block_meta evicted;
-                        if (!swap_mgr->evict_lru_block(k_tensors, v_tensors, seq_to_stream[seq_id], evicted, seq_id, &cells_mut)) {
-                            break;
-                        }
-                        for (uint32_t c = evicted.cell_start; c < evicted.cell_start + evicted.id.n_tokens && c < cells_mut.size(); ++c) {
-                            if (!cells_mut.is_empty(c)) {
-                                if (cells_mut.seq_has(c, evicted.id.seq_id)) {
-                                    cells_mut.seq_rm(c, evicted.id.seq_id);
-                                } else if (cells_mut.seq_count(c) <= 1) {
-                                    cells_mut.rm(c);
-                                }
+            // 3. If we didn't find enough, try to evict an LRU block
+            if (swap_mgr) {
+                std::vector<ggml_tensor *> k_tensors;
+                std::vector<ggml_tensor *> v_tensors;
+                for (const auto & l : layers) {
+                    k_tensors.push_back(l.k_stream[seq_to_stream[seq_id]]);
+                    v_tensors.push_back(l.v_stream[seq_to_stream[seq_id]]);
+                }
+                
+                bool any_evicted = false;
+                llama_kv_block_meta evicted;
+                if (swap_mgr->evict_lru_block(k_tensors, v_tensors, seq_to_stream[seq_id], evicted, seq_id, &cells_mut, true)) {
+                    for (uint32_t c = evicted.cell_start; c < evicted.cell_start + evicted.id.n_tokens && c < cells_mut.size(); ++c) {
+                        if (!cells_mut.is_empty(c)) {
+                            if (cells_mut.seq_has(c, evicted.id.seq_id)) {
+                                cells_mut.seq_rm(c, evicted.id.seq_id);
+                            } else if (cells_mut.seq_count(c) <= 1) {
+                                cells_mut.rm(c);
                             }
                         }
-                        evicted_tokens += evicted.id.n_tokens;
-                        any_evicted = true;
                     }
-
-                    if (any_evicted) {
-                        res.idxs[s].clear();
-                        n_tested = 0;
-                        head_cur = 0;
-                        continue;
-                    }
+                    any_evicted = true;
                 }
-                return { };
-            }
-        }
 
-        // we didn't find a suitable slot - return empty result
-        if (res.idxs[s].size() < n_tokens) {
+                if (any_evicted) {
+                    continue; // Try again after eviction
+                }
+            }
+
+            // We completely failed to find space or evict
+            res.idxs[s].clear();
             return { };
         }
     }
@@ -1268,8 +1241,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 k_tensors.push_back(l.k_stream[sinfo.strm[s]]);
                 v_tensors.push_back(l.v_stream[sinfo.strm[s]]);
             }
-            auto & cells = v_cells[sinfo.strm[s]];
-            swap_mgr->check_memory_pressure_and_evict(k_tensors, v_tensors, sinfo.strm[s], -1, &cells);
+            std::vector<llama_kv_cells *> cells_array;
+            for (auto & c : v_cells) {
+                cells_array.push_back(&c);
+            }
+            swap_mgr->check_memory_pressure_and_evict(k_tensors, v_tensors, sinfo.strm[s], -1, cells_array);
         }
 
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1291,7 +1267,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                     const uint32_t run_cell_start = sinfo.idxs[s][run_start_idx];
                     const llama_pos run_pos_start = (ubatch.pos && pos_idx + run_start_idx < ubatch.n_tokens) ? ubatch.pos[pos_idx + run_start_idx] : 0;
                     const llama_token * run_tok_ptr = tok_ptr ? tok_ptr + run_start_idx : nullptr;
-                    swap_mgr->register_block_tokens(seq_id, run_pos_start, run_tok_ptr, run_len, run_cell_start, sinfo.strm[s]);
+                    swap_mgr->register_block_tokens(seq_id, run_pos_start, run_tok_ptr, run_len, run_cell_start, sinfo.strm[s], &v_cells[sinfo.strm[s]]);
                     run_start_idx = i;
                 }
             }
@@ -1358,13 +1334,24 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 while (count < bid.n_tokens) {
                     llama_kv_block_meta evicted;
-                    if (swap_mgr->evict_lru_block(k_tensors, v_tensors, sinfo.strm[s], evicted, seq_id, &cells)) {
-                        for (uint32_t c = evicted.cell_start; c < evicted.cell_start + evicted.id.n_tokens && c < cells.size(); ++c) {
-                            if (!cells.is_empty(c)) {
-                                if (cells.seq_has(c, evicted.id.seq_id)) {
-                                    cells.seq_rm(c, evicted.id.seq_id);
-                                } else if (cells.seq_count(c) <= 1) {
-                                    cells.rm(c);
+                    if (swap_mgr->evict_lru_block(k_tensors, v_tensors, sinfo.strm[s], evicted, seq_id, &cells, true)) {
+                        // Guard: evict_lru_block may set cell_start = -1 when it
+                        // already cleaned the cells internally (e.g. spill target).
+                        if (evicted.cell_start != (uint32_t)-1) {
+                            for (uint32_t c = evicted.cell_start; c < evicted.cell_start + evicted.id.n_tokens && c < cells.size(); ++c) {
+                                // On UMA zero-copy, evict_lru_block marks cells warm=true
+                                // during HOT→WARM transition. We must clear the warm flag
+                                // here so that rm()/seq_rm() can fully release the cell
+                                // (set pos=-1) and make it available for swap_in.
+                                if (cells.is_warm(c)) {
+                                    cells.set_warm(c, false);
+                                }
+                                if (!cells.is_empty(c)) {
+                                    if (cells.seq_has(c, evicted.id.seq_id)) {
+                                        cells.seq_rm(c, evicted.id.seq_id);
+                                    } else if (cells.seq_count(c) <= 1) {
+                                        cells.rm(c);
+                                    }
                                 }
                             }
                         }
@@ -1495,7 +1482,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = sinfo.n_stream();
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
@@ -1516,7 +1503,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = sinfo.n_stream();
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
@@ -1638,6 +1625,19 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     return k_idxs;
 }
 
+
+ggml_tensor * llama_kv_cache::build_input_block_table(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    GGML_UNUSED(ubatch);
+    const uint32_t page_size = v_cells[0].page_size;
+    const uint32_t max_pages_per_stream = v_cells[0].pages.size();
+
+    ggml_tensor * block_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_pages_per_stream, ubatch.n_seqs_unq);
+    ggml_set_input(block_table);
+    ggml_format_name(block_table, "block_table");
+
+    return block_table;
+}
+
 ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -1710,6 +1710,36 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         }
     }
 }
+
+
+void llama_kv_cache::set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    int32_t * data = (int32_t *) dst->data;
+    const uint32_t page_size = v_cells[0].page_size;
+    const uint32_t max_pages_per_stream = v_cells[0].pages.size();
+
+    // Initialize all to -1
+    for (int i = 0; i < ggml_nelements(dst); ++i) {
+        data[i] = -1;
+    }
+
+    const uint32_t n_seqs = ubatch->n_seqs_unq;
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        llama_seq_id seq_id = ubatch->seq_id_unq[s];
+        
+        // Find the physical stream for this sequence
+        uint32_t strm = seq_to_stream[seq_id];
+        const auto & cells = v_cells[strm];
+        
+        const auto & pages = cells.seq_pages[seq_id];
+        for (uint32_t logical_page = 0; logical_page < pages.size(); ++logical_page) {
+            if (logical_page >= max_pages_per_stream) break;
+            // Global physical page ID
+            data[s * max_pages_per_stream + logical_page] = strm * max_pages_per_stream + pages[logical_page];
+        }
+    }
+}
+
+
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
@@ -2856,6 +2886,11 @@ ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, con
     return llama_kv_cache::build_input_k_idxs(ctx, ubatch);
 }
 
+
+ggml_tensor * llama_kv_cache_context::build_input_block_table(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_block_table(ctx, ubatch);
+}
+
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_v_idxs(ctx, ubatch);
 }
@@ -2875,6 +2910,13 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
 }
+
+
+void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_block_table(dst, ubatch);
+}
+
+
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);

@@ -1998,6 +1998,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_fill(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_PAGED_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
