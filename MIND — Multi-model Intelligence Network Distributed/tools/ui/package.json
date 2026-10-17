@@ -97,7 +97,7 @@
 		"typescript-eslint": "8.60.1",
 		"unified": "11.0.5",
 		"unist-util-visit": "5.1.0",
-		"uuid": "13.0.2",
+		"uuid": "14.0.2",
 		"vite": "7.3.6",
 		"vite-plugin-devtools-json": "0.2.1",
 		"vitest": "4.1.10",
